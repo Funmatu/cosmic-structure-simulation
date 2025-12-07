@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D宇宙膨張と構造形成シミュレーション (グリッド法最適化)</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; color: #fff; font-family: sans-serif; }
+        canvas { display: block; }
+        #info {
+            position: absolute; top: 10px; width: 100%; text-align: center; z-index: 100; display:block;
+            padding: 5px; background: rgba(0,0,0,0.5); font-size: 0.9em; color: #eee;
+        }
+        #controls-info {
+             position: absolute; bottom: 10px; left: 10px; z-index: 100; background: rgba(0,0,0,0.5);
+             padding: 8px; border-radius: 5px; font-size: 0.8em; max-width: 250px; color: #ccc;
+        }
+         #controls-info p { margin: 2px 0; }
+    </style>
+</head>
+<body>
+    <div id="info">
+        3D宇宙膨張と構造形成シミュレーション (グリッド法最適化)<br>
+        ダブルクリックでリセット
+    </div>
+     <div id="controls-info">
+        <p><b>操作:</b> 左ドラッグ:回転 / 右ドラッグ:移動 / ホイール:ズーム</p>
+        <p><b>表示:</b> 粒子が平坦な3D空間で膨張し、引力で集まる様子</p>
+     </div>
+
+    <!-- Import maps polyfill -->
+    <script async src="https://unpkg.com/es-module-shims@1.6.3/dist/es-module-shims.js"></script>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // --- 設定 ---
+        const numParticles = 7000; // 粒子数
+        const initialSpread = 6;
+        // let expansionVelocityFactor = 0.0018;
+	// let expansionVelocityFactor = 0.0025;
+	let expansionVelocityFactor = 0.0070;
+        // const initialSpeed = 0.15;
+	// const initialSpeed = 0.20;
+	const initialSpeed = 0.60;
+        let gravityFactor = 0.01;
+        const interactionRangeSq = 60 * 60;
+        const interactionRange = Math.sqrt(interactionRangeSq); // 平方根を計算しておく
+        // const velocityDampening = 0.985;
+        const velocityDampening = 0.997;
+        // const minDistanceSq = 0.8 * 0.8;
+        const minDistanceSq = 1.0 * 1.0;
+        // const repulsionFactor = 0.002;
+	const repulsionFactor = 0.0015;
+
+        // --- グリッド関連設定 ---
+        const cellSize = interactionRange; // セルサイズを相互作用範囲に合わせる
+        let grid = new Map(); // グリッドデータ構造 (キー: "ix_iy_iz", 値: 粒子インデックス配列)
+
+        // --- Three.js 初期化 ---
+        let scene, camera, renderer, controls, particleSystem;
+        let particleGeometry, particlesData = [];
+        let positionAttribute; // 位置属性をグローバルアクセス可能に
+
+        function init() {
+            if (renderer) {
+                 try { document.body.removeChild(renderer.domElement); } catch(e) {}
+                 renderer.dispose();
+            }
+            if (particleGeometry) particleGeometry.dispose();
+            if (particleSystem && particleSystem.material) particleSystem.material.dispose();
+
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 5000);
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            document.body.appendChild(renderer.domElement);
+
+            camera.position.z = 180;
+
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.05;
+            controls.minDistance = 1;
+            controls.maxDistance = 2500;
+
+            const ambientLight = new THREE.AmbientLight(0x606060);
+            scene.add(ambientLight);
+            const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+            directionalLight.position.set(1, 1, 1).normalize();
+            scene.add(directionalLight);
+
+            initParticles();
+
+            particleGeometry = new THREE.BufferGeometry();
+            // 位置属性を保持しておく
+            positionAttribute = new THREE.Float32BufferAttribute(particlesData.flatMap(p => [p.x, p.y, p.z]), 3);
+            particleGeometry.setAttribute('position', positionAttribute);
+            particleGeometry.setAttribute('particleColor', new THREE.Float32BufferAttribute(particlesData.flatMap(p => p.color), 3));
+            particleGeometry.setAttribute('particleSize', new THREE.Float32BufferAttribute(particlesData.map(p => p.size), 1));
+
+            const particleTexture = new THREE.TextureLoader().load('https://threejs.org/examples/textures/sprites/disc.png');
+
+            const particleMaterial = new THREE.ShaderMaterial({
+                 uniforms: { pointTexture: { value: particleTexture }, },
+                 vertexShader: `
+                    attribute float particleSize; attribute vec3 particleColor; varying vec3 vColor;
+                    void main() {
+                        vColor = particleColor; vec4 mvPosition = modelViewMatrix * vec4( position, 1.0 );
+                        float sizeFactor = particleSize * ( 300.0 / max(1.0, -mvPosition.z) );
+                        gl_PointSize = clamp(sizeFactor, 1.0, 20.0); gl_Position = projectionMatrix * mvPosition;
+                    }`,
+                 fragmentShader: `
+                    uniform sampler2D pointTexture; varying vec3 vColor;
+                    void main() {
+                        vec4 texColor = texture2D( pointTexture, gl_PointCoord ); if (texColor.a < 0.3) discard;
+                        gl_FragColor = vec4( vColor * texColor.rgb, texColor.a );
+                    }`,
+                 blending: THREE.AdditiveBlending, depthWrite: false, transparent: true, vertexColors: false
+            });
+
+            particleSystem = new THREE.Points(particleGeometry, particleMaterial);
+            scene.add(particleSystem);
+
+            camera.position.set(0, 0, 180);
+            controls.target.set(0, 0, 0);
+            controls.update();
+        }
+
+        function initParticles() {
+            particlesData = [];
+            const color = new THREE.Color();
+            for (let i = 0; i < numParticles; i++) {
+                 const r = Math.random() + Math.random(); const radius = r * initialSpread * 0.5;
+                 const theta = Math.random() * Math.PI * 2; const phi = Math.acos((Math.random() * 2) - 1);
+                 const x = radius * Math.sin(phi) * Math.cos(theta); const y = radius * Math.sin(phi) * Math.sin(theta); const z = radius * Math.cos(phi);
+                 const speed = initialSpeed * (0.7 + Math.random() * 0.6);
+                 let dirX = x, dirY = y, dirZ = z; const distSq = x*x + y*y + z*z;
+                 if (distSq > 0.001) { const invDist = 1.0 / Math.sqrt(distSq); dirX *= invDist; dirY *= invDist; dirZ *= invDist;}
+                 else { dirX = Math.random() - 0.5; dirY = Math.random() - 0.5; dirZ = Math.random() - 0.5; const norm = Math.sqrt(dirX*dirX + dirY*dirY + dirZ*dirZ); if (norm > 0.001) { dirX /= norm; dirY /= norm; dirZ /= norm;}}
+                 const tangentialFactor = (Math.random() - 0.5) * 0.2;
+                 const vx = speed * (dirX - tangentialFactor * dirY) + (Math.random()-0.5)*0.02; const vy = speed * (dirY + tangentialFactor * dirX) + (Math.random()-0.5)*0.02; const vz = speed * dirZ + (Math.random()-0.5)*0.02;
+                 color.setHSL(0.55 + Math.random() * 0.1, 0.9 + Math.random()*0.1, 0.65 + Math.random()*0.2);
+                 particlesData.push({ x, y, z, vx, vy, vz, color: [color.r, color.g, color.b], size: 0.9 + Math.random() * 2.0 });
+            }
+        }
+
+        // --- グリッド更新関数 ---
+        function updateGrid() {
+            grid.clear(); // グリッドをクリア
+            for (let i = 0; i < numParticles; i++) {
+                const p = particlesData[i];
+                // 粒子座標からセルインデックス計算
+                const ix = Math.floor(p.x / cellSize);
+                const iy = Math.floor(p.y / cellSize);
+                const iz = Math.floor(p.z / cellSize);
+                const cellKey = `${ix}_${iy}_${iz}`; // 文字列キー
+
+                // グリッドに粒子インデックスを追加
+                if (!grid.has(cellKey)) {
+                    grid.set(cellKey, []);
+                }
+                grid.get(cellKey).push(i);
+            }
+        }
+
+        // --- 物理計算関数 (グリッド使用) ---
+        function calculatePhysicsAndUpdate(effectiveDt) {
+            const positions = positionAttribute.array;
+            // 各粒子にかかる力を計算するための一次配列
+            const forces = particlesData.map(() => ({ fx: 0, fy: 0, fz: 0 }));
+
+            // ステップ 1: 近傍探索と力計算
+            for (let i = 0; i < numParticles; i++) {
+                const p = particlesData[i];
+                const ix = Math.floor(p.x / cellSize);
+                const iy = Math.floor(p.y / cellSize);
+                const iz = Math.floor(p.z / cellSize);
+
+                // 隣接セル (自身を含む3x3x3) を探索
+                for (let dx = -1; dx <= 1; dx++) {
+                    for (let dy = -1; dy <= 1; dy++) {
+                        for (let dz = -1; dz <= 1; dz++) {
+                            const checkX = ix + dx;
+                            const checkY = iy + dy;
+                            const checkZ = iz + dz;
+                            const cellKey = `${checkX}_${checkY}_${checkZ}`;
+
+                            if (grid.has(cellKey)) {
+                                const cellParticles = grid.get(cellKey);
+                                // セル内の粒子jと粒子iの相互作用を計算
+                                for (const j of cellParticles) {
+                                    // j > i の最適化はしない（実装をシンプルに保つ）
+                                    if (i === j) continue; // 自分自身とは計算しない
+
+                                    const other = particlesData[j];
+                                    const diffX = other.x - p.x;
+                                    const diffY = other.y - p.y;
+                                    const diffZ = other.z - p.z;
+                                    let distSq = diffX * diffX + diffY * diffY + diffZ * diffZ;
+
+                                    // interactionRangeSq 内か再チェック & 最小距離処理
+                                    if (distSq < interactionRangeSq && distSq > 0.001) {
+                                        distSq = Math.max(distSq, minDistanceSq);
+                                        const dist = Math.sqrt(distSq);
+                                        const invDist = 1.0 / dist;
+                                        const G = gravityFactor / distSq;
+                                        const R = -repulsionFactor * invDist;
+                                        const forceFactor = (distSq > minDistanceSq * 1.1) ? G : R;
+
+                                        // 粒子iが受ける力を蓄積
+                                        forces[i].fx += forceFactor * diffX * invDist;
+                                        forces[i].fy += forceFactor * diffY * invDist;
+                                        forces[i].fz += forceFactor * diffZ * invDist;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ステップ 2: 計算した力に基づいて速度と位置を更新
+            for (let i = 0; i < numParticles; i++) {
+                 const p = particlesData[i];
+                 const force = forces[i];
+
+                 // 力による加速度
+                 p.vx += force.fx * effectiveDt;
+                 p.vy += force.fy * effectiveDt;
+                 p.vz += force.fz * effectiveDt;
+
+                 // 膨張効果
+                 const distFromCenterSq = p.x * p.x + p.y * p.y + p.z * p.z;
+                 if (distFromCenterSq > 0.1) {
+                     const distFromCenter = Math.sqrt(distFromCenterSq);
+                     const normX = p.x / distFromCenter; const normY = p.y / distFromCenter; const normZ = p.z / distFromCenter;
+                     const expansionBoost = distFromCenter * expansionVelocityFactor;
+                     p.vx += normX * expansionBoost * effectiveDt;
+                     p.vy += normY * expansionBoost * effectiveDt;
+                     p.vz += normZ * expansionBoost * effectiveDt;
+                 }
+
+                 // 速度減衰
+                 const dampFactor = Math.pow(velocityDampening, effectiveDt);
+                 p.vx *= dampFactor; p.vy *= dampFactor; p.vz *= dampFactor;
+
+                 // 位置更新
+                 p.x += p.vx * effectiveDt; p.y += p.vy * effectiveDt; p.z += p.vz * effectiveDt;
+
+                 // BufferGeometryの配列を更新
+                 positions[i * 3] = p.x;
+                 positions[i * 3 + 1] = p.y;
+                 positions[i * 3 + 2] = p.z;
+            }
+             positionAttribute.needsUpdate = true; // 更新をGPUに通知
+        }
+
+
+        // --- アニメーションループ ---
+        let lastTime = 0;
+        function animate(currentTime) {
+             requestAnimationFrame(animate);
+
+             currentTime *= 0.001;
+             const dt = lastTime > 0 ? currentTime - lastTime : 0.0166; //0.016
+             lastTime = currentTime;
+             const effectiveDt = Math.min(dt, 1/60.0); // ステップ時間の上限 ; 1/30.0
+
+             // 1. グリッド更新
+             updateGrid();
+
+             // 2. 物理計算と位置更新 (グリッド使用)
+             calculatePhysicsAndUpdate(effectiveDt);
+
+             // 3. レンダリング
+             controls.update();
+             renderer.render(scene, camera);
+        }
+
+        // --- イベントリスナー ---
+        window.addEventListener('resize', () => {
+            if (!camera || !renderer) return;
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        window.addEventListener('dblclick', () => {
+             try { init(); } catch(error) { console.error("リセットエラー:", error); }
+        });
+
+        // --- 開始 ---
+        try {
+             init();
+             animate(0);
+        } catch (error) {
+            console.error("シミュレーション開始エラー:", error);
+            alert("シミュレーションの開始中にエラーが発生しました。開発者コンソールを確認してください。");
+        }
+
+    </script>
+</body>
+</html>
